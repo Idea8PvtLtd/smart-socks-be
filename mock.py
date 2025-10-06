@@ -4,8 +4,8 @@ import math
 import os
 import time
 import random
-from datetime import datetime
-from typing import Dict, List, Set, Callable
+from datetime import datetime, timedelta
+from typing import Dict, List, Set, Callable, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -15,7 +15,7 @@ load_dotenv()
 WEARERS_JSON = os.getenv("WEARERS_JSON")
 
 # ---- Helper to read an env var with fallbacks ----
-def env_any(*names: str) -> str | None:
+def env_any(*names: str) -> Optional[str]:
     for n in names:
         v = os.getenv(n)
         if v:
@@ -23,7 +23,7 @@ def env_any(*names: str) -> str | None:
     return None
 
 # ================== CHART DIRS (supports multiple env names) ==================
-CHART_DIRS: Dict[str, str | None] = {
+CHART_DIRS: Dict[str, Optional[str]] = {
     # earlier 6
     "activity": env_any("ACTIVITY_DIR"),
     "calmness": env_any("CALMNESS_DIR"),
@@ -40,16 +40,26 @@ CHART_DIRS: Dict[str, str | None] = {
     "steps": env_any("STEPS_DIR"),
     "step_time_var": env_any("STEP_TIME_VARIATION_DIR", "STEP_TIMES_VARIATION_DIR"),
     "symmetry": env_any("SYMMETRY_DIR"),
-    "turns": env_any("TURNS_DIR", "TURNS"),         # <-- supports TURNS or TURNS_DIR
-    "walking": env_any("WALKING_DIR", "WALKING__DIR", "WALKING"),  # <-- supports WALKING__DIR
+    "turns": env_any("TURNS_DIR", "TURNS"),         # supports TURNS or TURNS_DIR
+    "walking": env_any("WALKING_DIR", "WALKING__DIR", "WALKING"),  # supports WALKING__DIR
 }
 
 # deletion controls
 DELETE_ON_REMOVAL = (os.getenv("DELETE_ON_REMOVAL", "false").strip().lower() == "true")
 DRY_RUN = (os.getenv("DRY_RUN", "false").strip().lower() == "true")
 
-# Poll JSON every N seconds
-WEARERS_POLL_SEC = 15
+# JSON poll
+WEARERS_POLL_SEC = int(os.getenv("WEARERS_POLL_SEC", "15"))
+
+# ====== BACKFILL CONFIG ======
+# How many days to ensure exist historically (default 60 days ≈ two months)
+BACKFILL_DAYS = int(os.getenv("BACKFILL_DAYS", "60"))
+# Backfill step: "second" or "minute" (minute is MUCH smaller/faster)
+BACKFILL_STEP = os.getenv("BACKFILL_STEP", "minute").strip().lower()
+# Validate/normalize
+if BACKFILL_STEP not in ("second", "minute"):
+    BACKFILL_STEP = "minute"
+BACKFILL_STEP_SECONDS = 1 if BACKFILL_STEP == "second" else 60
 
 # ================== GENERATORS (per-second) ==================
 def _id_num(wearer_id: str) -> int:
@@ -247,10 +257,10 @@ def ensure_file_with_header(dir_path: str, wearer_id: str) -> str:
         print(f"✅ header created: {file_path}")
     return file_path
 
-def append_row(file_path: str, y_str: str, now: datetime, tz: str):
-    x_str = f"{now.strftime('%Y-%m-%d %H:%M:%S')}{tz}"
-    time_str = now.strftime("%H:%M:%S")
-    date_str = now.strftime("%Y-%m-%d")
+def append_row(file_path: str, y_str: str, ts: datetime, tz: str):
+    x_str = f"{ts.strftime('%Y-%m-%d %H:%M:%S')}{tz}"
+    time_str = ts.strftime("%H:%M:%S")
+    date_str = ts.strftime("%Y-%m-%d")
     with open(file_path, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([x_str, y_str, time_str, date_str])
 
@@ -289,7 +299,120 @@ def load_wearer_ids(json_path: str) -> List[str]:
     except Exception:
         return []
 
-# ================== MAIN (per-second cadence) ==================
+# --------- CSV scan helpers (to decide backfill need) ---------
+def parse_first_last_ts(file_path: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Returns (first_ts, last_ts) from CSV (based on column x => 'YYYY-mm-dd HH:MM:SS+TZ').
+    If file has only header or is missing, returns (None, None).
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        return (None, None)
+
+    first_ts = None
+    last_ts = None
+    try:
+        # First ts
+        with open(file_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row or (row[0].lower() == "x"):
+                    continue
+                x = row[0]
+                x_no_tz = x.split("+")[0] if "+" in x else x
+                first_ts = datetime.strptime(x_no_tz, "%Y-%m-%d %H:%M:%S")
+                break
+        # Last ts (tail scan)
+        with open(file_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            size = 4096
+            chunk = b""
+            pos = end
+            while pos > 0:
+                read_size = size if pos - size > 0 else pos
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size) + chunk
+                if chunk.count(b"\n") > 5:
+                    break
+            lines = [ln.decode("utf-8").strip() for ln in chunk.splitlines() if ln.strip()]
+            for line in reversed(lines):
+                if line.lower().startswith("x,"):
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 1:
+                    x = parts[0]
+                    x_no_tz = x.split("+")[0] if "+" in x else x
+                    last_ts = datetime.strptime(x_no_tz, "%Y-%m-%d %H:%M:%S")
+                    break
+    except Exception:
+        pass
+    return (first_ts, last_ts)
+
+def needs_backfill(first_ts: Optional[datetime], required_start: datetime) -> bool:
+    """
+    We need backfill if we have no data or our earliest data is AFTER the required start.
+    """
+    if first_ts is None:
+        return True
+    return first_ts > required_start
+
+def backfill_one_file(chart: str, dir_path: str, wearer_id: str, tz: str, required_start: datetime):
+    """
+    Backfill a single CSV from required_start up to (first_existing_ts - step),
+    or up to 'now - step' if the file has no data at all.
+    """
+    file_path = os.path.join(dir_path, f"{wearer_id}.csv")
+    ensure_file_with_header(dir_path, wearer_id)
+    first_ts, last_ts = parse_first_last_ts(file_path)
+
+    if not needs_backfill(first_ts, required_start):
+        return  # already has at least two months historical coverage
+
+    # Determine backfill end (exclusive)
+    if first_ts is not None:
+        backfill_end_exclusive = first_ts  # stop right before first existing row
+    else:
+        backfill_end_exclusive = datetime.now()
+
+    # Safety: if required_start >= end, nothing to do
+    if required_start >= backfill_end_exclusive:
+        return
+
+    gen_fn = GEN_MAP[chart]
+    fmt_fn = FORMAT_MAP[chart]
+
+    # Align start to step boundary (drop seconds if minute mode)
+    if BACKFILL_STEP_SECONDS == 60:
+        start_ts = required_start.replace(second=0, microsecond=0)
+    else:
+        start_ts = required_start.replace(microsecond=0)
+
+    # Iterate and append
+    ts = start_ts
+    step = timedelta(seconds=BACKFILL_STEP_SECONDS)
+    # Write in chunks to avoid keeping file open too long
+    with open(file_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        while ts < backfill_end_exclusive:
+            val = gen_fn(ts, wearer_id)
+            y_str = fmt_fn(val)
+            x_str = f"{ts.strftime('%Y-%m-%d %H:%M:%S')}{tz}"
+            writer.writerow([x_str, y_str, ts.strftime("%H:%M:%S"), ts.strftime("%Y-%m-%d")])
+            ts += step
+
+    print(f"📦 backfilled {chart}/{wearer_id}.csv from {start_ts} to {backfill_end_exclusive} ({BACKFILL_STEP} steps)")
+
+def backfill_all(configured: Dict[str, str], wearer_ids: Set[str], tz: str):
+    """
+    For every chart+wearer, ensure we have at least BACKFILL_DAYS of history.
+    """
+    required_start = (datetime.now() - timedelta(days=BACKFILL_DAYS))
+    for wid in wearer_ids:
+        for chart, dir_path in configured.items():
+            backfill_one_file(chart, dir_path, wid, tz, required_start)
+
+# ================== MAIN (per-second cadence + backfill) ==================
 if __name__ == "__main__":
     configured = {k: v for k, v in CHART_DIRS.items() if v}
     if not WEARERS_JSON or not configured:
@@ -299,9 +422,11 @@ if __name__ == "__main__":
             f"Missing dirs: {', '.join(missing)}"
         )
 
-    print("🚀 Smart Socks CSV generator (multi-user, SECOND cadence, live JSON discovery)")
+    print("🚀 Smart Socks CSV generator (multi-user, SECOND cadence, live JSON discovery + startup backfill)")
     print(f"🧹 DELETE_ON_REMOVAL={DELETE_ON_REMOVAL} | DRY_RUN={DRY_RUN}")
+    print(f"🗓️ Backfill: last {BACKFILL_DAYS} days at {BACKFILL_STEP} resolution")
 
+    # Prepare known wearers & files
     known_ids: Set[str] = set()
     current_ids = set(load_wearer_ids(WEARERS_JSON))
     for wid in current_ids:
@@ -310,12 +435,18 @@ if __name__ == "__main__":
     known_ids |= current_ids
 
     tz = tz_offset_colon()
+
+    # ===== BACKFILL on startup =====
+    if BACKFILL_DAYS > 0:
+        backfill_all(configured, known_ids, tz)
+
+    # ===== Live loop (per-second appends) =====
     last_json_check = time.monotonic()
 
     while True:
         now = datetime.now()
 
-        # JSON re-scan
+        # JSON re-scan (adds/removals)
         if time.monotonic() - last_json_check >= WEARERS_POLL_SEC:
             last_json_check = time.monotonic()
             ids = set(load_wearer_ids(WEARERS_JSON))
@@ -332,6 +463,8 @@ if __name__ == "__main__":
                 for wid in added:
                     for _, d in configured.items():
                         ensure_file_with_header(d, wid)
+                # Backfill for newly discovered users too
+                backfill_all(configured, added, tz)
 
             known_ids = ids
 
@@ -344,7 +477,5 @@ if __name__ == "__main__":
                 val = GEN_MAP[chart](now, wid)
                 y_str = FORMAT_MAP[chart](val)
                 append_row(file_path, y_str, now, tz)
-                # Optional log:
-                # print(f"📝 {chart}/{wid}.csv -> {now.strftime('%H:%M:%S')} = {y_str}")
 
         time.sleep(1)
